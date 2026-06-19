@@ -4,14 +4,18 @@ import { supabase } from '../../lib/supabase'
 import { useAuth } from '../../hooks/useAuth'
 import type { Lobby } from '../../lib/database.types'
 
-const STAKE_OPTIONS = [0, 10, 20, 50, 100]
+const STAKE_PRESETS = [0, 10, 20, 50, 100]
 
 export function AdminLobbies() {
   const { player } = useAuth()
   const [lobbies, setLobbies] = useState<Lobby[]>([])
   const [title, setTitle] = useState('')
   const [stakeAmount, setStakeAmount] = useState(10)
+  const [customStake, setCustomStake] = useState('')
+  const [useCustomStake, setUseCustomStake] = useState(false)
   const [maxPlayers, setMaxPlayers] = useState(100)
+
+  const finalStake = useCustomStake ? (parseInt(customStake) || 0) : stakeAmount
   const [creating, setCreating] = useState(false)
   const [generatingId, setGeneratingId] = useState<string | null>(null)
 
@@ -36,7 +40,7 @@ export function AdminLobbies() {
       .insert({
         title: title.trim(),
         max_players: maxPlayers,
-        stake_amount: stakeAmount,
+        stake_amount: finalStake,
         status: 'waiting',
         prize_pool: 0,
         countdown_seconds: 60,
@@ -88,13 +92,13 @@ export function AdminLobbies() {
         {/* Stake picker */}
         <div>
           <label className="text-xs text-gray-500 mb-1 block">Stake Amount (ETB)</label>
-          <div className="flex gap-2 flex-wrap">
-            {STAKE_OPTIONS.map(s => (
+          <div className="flex gap-2 flex-wrap mb-2">
+            {STAKE_PRESETS.map(s => (
               <button
                 key={s}
-                onClick={() => setStakeAmount(s)}
+                onClick={() => { setStakeAmount(s); setUseCustomStake(false) }}
                 className={`px-3 py-1.5 rounded-lg text-sm font-semibold border transition-colors ${
-                  stakeAmount === s
+                  !useCustomStake && stakeAmount === s
                     ? 'bg-purple-600 text-white border-purple-600'
                     : 'border-gray-300 text-gray-600'
                 }`}
@@ -102,7 +106,29 @@ export function AdminLobbies() {
                 {s === 0 ? 'FREE' : `${s} ETB`}
               </button>
             ))}
+            <button
+              onClick={() => setUseCustomStake(true)}
+              className={`px-3 py-1.5 rounded-lg text-sm font-semibold border transition-colors ${
+                useCustomStake ? 'bg-purple-600 text-white border-purple-600' : 'border-gray-300 text-gray-600'
+              }`}
+            >
+              Custom
+            </button>
           </div>
+          {useCustomStake && (
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                value={customStake}
+                onChange={e => setCustomStake(e.target.value)}
+                placeholder="Enter stake amount"
+                min="0"
+                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+              />
+              <span className="text-sm text-gray-500">ETB</span>
+            </div>
+          )}
+          <p className="text-xs text-gray-400 mt-1">Final stake: <strong>{finalStake} ETB</strong></p>
         </div>
 
         <div className="flex items-center gap-2">

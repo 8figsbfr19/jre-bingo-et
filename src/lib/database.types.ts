@@ -30,6 +30,9 @@ export interface LobbyPlayer {
   lobby_id: string
   player_id: string
   joined_at: string
+  auto_clicker_enabled: boolean
+  auto_clicker_fee: number
+  false_claim_count: number
 }
 
 export interface LobbyCard {

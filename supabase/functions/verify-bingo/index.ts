@@ -38,75 +38,89 @@ serve(async (req) => {
 
   // Load claim
   const { data: claim } = await adminClient
-    .from('bingo_claims')
-    .select('*')
-    .eq('id', claim_id)
-    .single()
-
+    .from('bingo_claims').select('*').eq('id', claim_id).single()
   if (!claim) return new Response('Claim not found', { status: 404, headers: corsHeaders })
 
+  // Idempotency: already processed
   if (claim.status !== 'pending') {
-    return new Response(JSON.stringify({ status: claim.status }), {
+    return new Response(JSON.stringify({ status: claim.status, already_processed: true }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   }
 
-  // Load the card — prefer lobby_card_id (new flow), fall back to card_id (legacy)
-  let cardData: (number | null)[][] | null = null
-
-  if (claim.lobby_card_id) {
-    const { data: lc } = await adminClient
-      .from('lobby_cards')
-      .select('card_data')
-      .eq('id', claim.lobby_card_id)
-      .single()
-    cardData = lc?.card_data ?? null
-  } else if (claim.card_id) {
-    const { data: bc } = await adminClient
-      .from('bingo_cards')
-      .select('card_numbers')
-      .eq('id', claim.card_id)
-      .single()
-    cardData = bc?.card_numbers ?? null
+  // Idempotency: lobby already completed
+  const { data: lobby } = await adminClient.from('lobbies').select('status, stake_amount').eq('id', claim.lobby_id).single()
+  if (lobby?.status === 'completed') {
+    return new Response(JSON.stringify({ status: 'lobby_completed' }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
   }
 
+  // Load card data — prefer lobby_card_id, fall back to card_id
+  let cardData: (number | null)[][] | null = null
+  if (claim.lobby_card_id) {
+    const { data: lc } = await adminClient.from('lobby_cards').select('card_data').eq('id', claim.lobby_card_id).single()
+    cardData = lc?.card_data ?? null
+  } else if (claim.card_id) {
+    const { data: bc } = await adminClient.from('bingo_cards').select('card_numbers').eq('id', claim.card_id).single()
+    cardData = bc?.card_numbers ?? null
+  }
   if (!cardData) return new Response('Card not found', { status: 404, headers: corsHeaders })
 
-  // Load all called numbers
+  // Load called numbers
   const { data: calledRows } = await adminClient
-    .from('called_numbers')
-    .select('number')
-    .eq('lobby_id', claim.lobby_id)
-
+    .from('called_numbers').select('number').eq('lobby_id', claim.lobby_id)
   const calledSet = new Set((calledRows ?? []).map(r => r.number))
+
   const won = checkWin(cardData, calledSet)
   const newStatus = won ? 'verified' : 'rejected'
 
-  // Update claim
+  // Update claim status
   await adminClient.from('bingo_claims').update({ status: newStatus }).eq('id', claim_id)
 
   if (won) {
-    // Count players and called numbers for history
+    // Count confirmed players for prize pool
     const { count: totalPlayers } = await adminClient
-      .from('lobby_players')
-      .select('*', { count: 'exact', head: true })
-      .eq('lobby_id', claim.lobby_id)
+      .from('lobby_players').select('*', { count: 'exact', head: true }).eq('lobby_id', claim.lobby_id)
 
-    // Insert game_history
-    await adminClient.from('game_history').insert({
-      lobby_id: claim.lobby_id,
-      winner_id: claim.player_id,
-      winner_card_id: claim.lobby_card_id ?? null,
-      prize_pool: 0,  // placeholder — real money in V2
-      total_players: totalPlayers ?? 0,
-      balls_called: calledRows?.length ?? 0,
-    })
+    const prizePool = (totalPlayers ?? 0) * (lobby?.stake_amount ?? 0)
+
+    // Insert game_history — ON CONFLICT DO NOTHING prevents duplicates
+    await adminClient.from('game_history').upsert(
+      {
+        lobby_id: claim.lobby_id,
+        winner_id: claim.player_id,
+        winner_card_id: claim.lobby_card_id ?? null,
+        prize_pool: prizePool,
+        total_players: totalPlayers ?? 0,
+        balls_called: calledRows?.length ?? 0,
+      },
+      { onConflict: 'lobby_id', ignoreDuplicates: true },
+    )
 
     // Complete the lobby
-    await adminClient
-      .from('lobbies')
-      .update({ status: 'completed', ended_at: new Date().toISOString() })
-      .eq('id', claim.lobby_id)
+    await adminClient.from('lobbies').update({
+      status: 'completed',
+      ended_at: new Date().toISOString(),
+      prize_pool: prizePool,
+    }).eq('id', claim.lobby_id)
+
+  } else {
+    // Rejected: increment false_claim_count on lobby_players
+    // First read current count, then increment (no atomic increment via RLS client)
+    const { data: lp } = await adminClient
+      .from('lobby_players')
+      .select('id, false_claim_count')
+      .eq('lobby_id', claim.lobby_id)
+      .eq('player_id', claim.player_id)
+      .single()
+
+    if (lp) {
+      await adminClient
+        .from('lobby_players')
+        .update({ false_claim_count: (lp.false_claim_count ?? 0) + 1 })
+        .eq('id', lp.id)
+    }
   }
 
   return new Response(JSON.stringify({ status: newStatus }), {
