@@ -6,17 +6,10 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
-
-  const { initData } = await req.json()
-  if (!initData) return new Response('Missing initData', { status: 400, headers: corsHeaders })
-
-  const botToken = Deno.env.get('TELEGRAM_BOT_TOKEN')!
-
-  // Validate HMAC-SHA256
+async function verifyHmac(initData: string, botToken: string): Promise<boolean> {
   const params = new URLSearchParams(initData)
   const hash = params.get('hash')
+  if (!hash) return false
   params.delete('hash')
 
   const checkString = [...params.entries()]
@@ -24,118 +17,157 @@ serve(async (req) => {
     .map(([k, v]) => `${k}=${v}`)
     .join('\n')
 
-  const secretKeyRaw = await crypto.subtle.importKey(
+  // secret = HMAC-SHA256("WebAppData", botToken)
+  const webAppDataKey = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode('WebAppData'),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
   )
-  const secretKey = await crypto.subtle.sign('HMAC', secretKeyRaw, new TextEncoder().encode(botToken))
+  const secretBytes = await crypto.subtle.sign('HMAC', webAppDataKey, new TextEncoder().encode(botToken))
 
   const signingKey = await crypto.subtle.importKey(
     'raw',
-    secretKey,
+    secretBytes,
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
   )
-  const signature = await crypto.subtle.sign('HMAC', signingKey, new TextEncoder().encode(checkString))
-  const computedHash = Array.from(new Uint8Array(signature))
+  const sigBytes = await crypto.subtle.sign('HMAC', signingKey, new TextEncoder().encode(checkString))
+  const computed = Array.from(new Uint8Array(sigBytes))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 
-  if (computedHash !== hash) {
-    return new Response('Invalid initData', { status: 401, headers: corsHeaders })
+  return computed === hash
+}
+
+async function derivePassword(botToken: string, telegramId: number): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(botToken),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(String(telegramId)))
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
+
+  let body: { initData?: string }
+  try {
+    body = await req.json()
+  } catch {
+    return new Response('Invalid JSON', { status: 400, headers: corsHeaders })
   }
 
-  // Parse user from initData
+  const { initData } = body
+  if (!initData) return new Response('Missing initData', { status: 400, headers: corsHeaders })
+
+  const botToken = Deno.env.get('TELEGRAM_BOT_TOKEN')
+  if (!botToken) return new Response('Bot token not configured', { status: 500, headers: corsHeaders })
+
+  // Verify Telegram HMAC signature
+  const valid = await verifyHmac(initData, botToken)
+  if (!valid) return new Response('Invalid initData signature', { status: 401, headers: corsHeaders })
+
+  // Parse Telegram user
+  const params = new URLSearchParams(initData)
   const userRaw = params.get('user')
   if (!userRaw) return new Response('No user in initData', { status: 400, headers: corsHeaders })
-  const tgUser = JSON.parse(userRaw)
 
-  // Upsert player using service role client
+  let tgUser: { id: number; username?: string; first_name?: string; last_name?: string }
+  try {
+    tgUser = JSON.parse(userRaw)
+  } catch {
+    return new Response('Invalid user JSON', { status: 400, headers: corsHeaders })
+  }
+
   const serviceClient = createClient(
     Deno.env.get('SUPABASE_URL')!,
     Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
   )
 
-  const { data: player, error } = await serviceClient
+  const email = `tg_${tgUser.id}@bingo.local`
+  const password = await derivePassword(botToken, tgUser.id)
+
+  // Try to sign in (returning user path — fast and simple)
+  const { data: signInData } = await serviceClient.auth.signInWithPassword({ email, password })
+
+  let session = signInData?.session
+  let userId = signInData?.user?.id
+
+  if (!session) {
+    // New user — create auth account, then sign in
+    const { data: createData, error: createErr } = await serviceClient.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+    })
+
+    if (createErr && !createErr.message.toLowerCase().includes('already registered')) {
+      return new Response(`Create user failed: ${createErr.message}`, { status: 500, headers: corsHeaders })
+    }
+
+    userId = createData?.user?.id
+
+    const { data: signIn2, error: signIn2Err } = await serviceClient.auth.signInWithPassword({ email, password })
+    if (signIn2Err || !signIn2?.session) {
+      return new Response(`Sign in failed: ${signIn2Err?.message ?? 'no session'}`, { status: 500, headers: corsHeaders })
+    }
+    session = signIn2.session
+    userId = signIn2.user?.id
+  }
+
+  if (!session || !userId) {
+    return new Response('Could not create session', { status: 500, headers: corsHeaders })
+  }
+
+  // Upsert player — check by telegram_id first to avoid PK conflicts
+  const { data: existing } = await serviceClient
     .from('players')
-    .upsert(
-      {
+    .select('*')
+    .eq('telegram_id', tgUser.id)
+    .single()
+
+  let player
+  if (existing) {
+    const { data: updated } = await serviceClient
+      .from('players')
+      .update({
+        telegram_username: tgUser.username ?? null,
+        first_name: tgUser.first_name ?? null,
+        last_name: tgUser.last_name ?? null,
+      })
+      .eq('telegram_id', tgUser.id)
+      .select('*')
+      .single()
+    player = updated
+  } else {
+    const { data: inserted, error: insertErr } = await serviceClient
+      .from('players')
+      .insert({
+        id: userId,
         telegram_id: tgUser.id,
         telegram_username: tgUser.username ?? null,
         first_name: tgUser.first_name ?? null,
         last_name: tgUser.last_name ?? null,
-      },
-      { onConflict: 'telegram_id' },
-    )
-    .select('*')
-    .single()
-
-  if (error) return new Response(error.message, { status: 500, headers: corsHeaders })
-
-  // Sign a Supabase JWT for this player
-  const { data: authData, error: authError } = await serviceClient.auth.admin.generateLink({
-    type: 'magiclink',
-    email: `${tgUser.id}@telegram.user`,
-  })
-
-  if (authError) return new Response(authError.message, { status: 500, headers: corsHeaders })
-
-  // Create a real session via sign-in with OTP verification (token_hash approach)
-  // Instead, we sign the user in using admin API
-  const { data: sessionData, error: sessionError } = await serviceClient.auth.admin.createUser({
-    email: `${tgUser.id}@telegram.user`,
-    email_confirm: true,
-    user_metadata: { player_id: player.id },
-    app_metadata: { player_id: player.id },
-  })
-
-  // User may already exist — that's fine
-  const userId = sessionData?.user?.id ?? (await (async () => {
-    const { data } = await serviceClient.auth.admin.listUsers()
-    return data.users.find((u) => u.email === `${tgUser.id}@telegram.user`)?.id
-  })())
-
-  if (!userId) return new Response('Could not resolve auth user', { status: 500, headers: corsHeaders })
-
-  // Update player id to match auth user id if needed (first time)
-  await serviceClient.from('players').update({ id: userId }).eq('telegram_id', tgUser.id).neq('id', userId)
-
-  const { data: tokens, error: tokenError } = await serviceClient.auth.admin.generateLink({
-    type: 'magiclink',
-    email: `${tgUser.id}@telegram.user`,
-  })
-
-  if (tokenError) return new Response(tokenError.message, { status: 500, headers: corsHeaders })
-
-  // Exchange magic link token for session tokens
-  const anonClient = createClient(
-    Deno.env.get('SUPABASE_URL')!,
-    Deno.env.get('SUPABASE_ANON_KEY')!,
-  )
-
-  const token = new URL(tokens.properties!.action_link).searchParams.get('token')!
-  const { data: session, error: verifyError } = await anonClient.auth.verifyOtp({
-    type: 'magiclink',
-    token_hash: token,
-  })
-
-  if (verifyError || !session.session) {
-    return new Response(verifyError?.message ?? 'No session', { status: 500, headers: corsHeaders })
+      })
+      .select('*')
+      .single()
+    if (insertErr) return new Response(`Player insert failed: ${insertErr.message}`, { status: 500, headers: corsHeaders })
+    player = inserted
   }
 
   return new Response(
     JSON.stringify({
-      access_token: session.session.access_token,
-      refresh_token: session.session.refresh_token,
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
       player,
     }),
     { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
   )
-
-  void authData
-  void sessionError
 })
