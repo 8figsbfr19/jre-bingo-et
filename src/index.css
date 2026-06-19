@@ -9,5 +9,10 @@
 
 body {
   margin: 0;
-  background: #f9fafb;
+  background: #0d0923;
+  overscroll-behavior: none;
+}
+
+.safe-area-pb {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }

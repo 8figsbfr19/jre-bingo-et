@@ -2,6 +2,22 @@
 create extension if not exists "pgcrypto";
 
 -- ─────────────────────────────────────────
+-- Helper: admin check (security definer bypasses RLS to avoid recursion)
+-- ─────────────────────────────────────────
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select coalesce(
+    (select is_admin from public.players where id = auth.uid()),
+    false
+  )
+$$;
+
+-- ─────────────────────────────────────────
 -- players
 -- ─────────────────────────────────────────
 create table players (
@@ -16,22 +32,18 @@ create table players (
 
 alter table players enable row level security;
 
--- Players can read their own row; admins can read all
 create policy "players_select_own" on players
   for select using (
     auth.uid()::text = id::text
-    or exists (
-      select 1 from players p2
-      where p2.id::text = auth.uid()::text and p2.is_admin = true
-    )
+    or public.is_admin()
   );
 
--- Only Edge Functions (service role) may insert/update
-create policy "players_insert_service" on players
-  for insert with check (auth.role() = 'service_role');
+-- Players insert/update their own row (id must match their auth.uid())
+create policy "players_insert_self" on players
+  for insert with check (id::text = auth.uid()::text);
 
-create policy "players_update_service" on players
-  for update using (auth.role() = 'service_role');
+create policy "players_update_self" on players
+  for update using (id::text = auth.uid()::text);
 
 -- ─────────────────────────────────────────
 -- lobbies
@@ -54,12 +66,7 @@ create policy "lobbies_select_all" on lobbies
   for select using (true);
 
 create policy "lobbies_write_admin" on lobbies
-  for all using (
-    exists (
-      select 1 from players p
-      where p.id::text = auth.uid()::text and p.is_admin = true
-    )
-  );
+  for all using (public.is_admin());
 
 -- ─────────────────────────────────────────
 -- lobby_players
@@ -99,10 +106,7 @@ alter table bingo_cards enable row level security;
 create policy "bingo_cards_select_own" on bingo_cards
   for select using (
     player_id::text = auth.uid()::text
-    or exists (
-      select 1 from players p
-      where p.id::text = auth.uid()::text and p.is_admin = true
-    )
+    or public.is_admin()
   );
 
 create policy "bingo_cards_insert_service" on bingo_cards
@@ -146,10 +150,7 @@ alter table bingo_claims enable row level security;
 create policy "bingo_claims_select_participant" on bingo_claims
   for select using (
     player_id::text = auth.uid()::text
-    or exists (
-      select 1 from players p
-      where p.id::text = auth.uid()::text and p.is_admin = true
-    )
+    or public.is_admin()
   );
 
 create policy "bingo_claims_insert_self" on bingo_claims

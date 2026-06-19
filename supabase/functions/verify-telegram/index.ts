@@ -126,28 +126,36 @@ serve(async (req) => {
     return new Response('Could not create session', { status: 500, headers: corsHeaders })
   }
 
-  // Upsert player — check by telegram_id first to avoid PK conflicts
-  const { data: existing } = await serviceClient
+  // Use the user's own session for player row writes.
+  // This satisfies "id = auth.uid()" self-based RLS policies without
+  // depending on service_role BYPASSRLS resolution.
+  const userClient = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: `Bearer ${session.access_token}` } } },
+  )
+
+  const { data: existing } = await userClient
     .from('players')
     .select('*')
-    .eq('telegram_id', tgUser.id)
+    .eq('id', userId)
     .single()
 
   let player
   if (existing) {
-    const { data: updated } = await serviceClient
+    const { data: updated } = await userClient
       .from('players')
       .update({
         telegram_username: tgUser.username ?? null,
         first_name: tgUser.first_name ?? null,
         last_name: tgUser.last_name ?? null,
       })
-      .eq('telegram_id', tgUser.id)
+      .eq('id', userId)
       .select('*')
       .single()
     player = updated
   } else {
-    const { data: inserted, error: insertErr } = await serviceClient
+    const { data: inserted, error: insertErr } = await userClient
       .from('players')
       .insert({
         id: userId,
