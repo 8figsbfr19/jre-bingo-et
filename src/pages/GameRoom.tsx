@@ -9,6 +9,8 @@ import { BingoCardDisplay } from '../components/BingoCardDisplay'
 import { checkWin, columnLetter } from '../lib/bingo'
 import type { LobbyCard } from '../lib/database.types'
 
+type ClaimState = 'idle' | 'submitting' | 'pending' | 'verified' | 'rejected_valid' | 'false_claim'
+
 export function GameRoom() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -18,12 +20,10 @@ export function GameRoom() {
   const { player } = useAuth()
 
   const [myCard, setMyCard] = useState<LobbyCard | null>(null)
-  const [claiming, setClaiming] = useState(false)
-  const [claimed, setClaimed] = useState(false)
-  const [claimStatus, setClaimStatus] = useState<'pending' | 'verified' | 'rejected' | null>(null)
-  const [falseClaimCount, setFalseClaimCount] = useState(0)
-  const [showFalseClaimModal, setShowFalseClaimModal] = useState(false)
+  const [claimState, setClaimState] = useState<ClaimState>('idle')
+  const [isKicked, setIsKicked] = useState(false)
   const [manuallyMarked, setManuallyMarked] = useState(new Set<number>())
+  const [showFalseClaimModal, setShowFalseClaimModal] = useState(false)
   const [animNum, setAnimNum] = useState<number | null>(null)
   const [prevCount, setPrevCount] = useState(0)
 
@@ -34,19 +34,21 @@ export function GameRoom() {
     if (mine) setMyCard(mine)
   }, [cards, player])
 
-  // Fetch lobby_players (for false_claim_count)
+  // Check if player is already kicked on mount
   useEffect(() => {
     if (!id || !player) return
     supabase
       .from('lobby_players')
-      .select('false_claim_count')
+      .select('status')
       .eq('lobby_id', id)
       .eq('player_id', player.id)
       .single()
-      .then(({ data }) => { if (data) setFalseClaimCount(data.false_claim_count ?? 0) })
+      .then(({ data }) => {
+        if (data?.status === 'kicked') setIsKicked(true)
+      })
   }, [id, player])
 
-  // Realtime: watch own claim status changes
+  // Realtime: watch own claim status
   useEffect(() => {
     if (!id || !player) return
     const ch = supabase
@@ -56,18 +58,19 @@ export function GameRoom() {
         filter: `lobby_id=eq.${id}`,
       }, (payload) => {
         if (payload.new.player_id !== player.id) return
-        const status = payload.new.status as 'pending' | 'verified' | 'rejected'
-        setClaimStatus(status)
+        const status = payload.new.status as string
+        if (status === 'verified') setClaimState('verified')
         if (status === 'rejected') {
-          setClaimed(false)
-          setFalseClaimCount(c => c + 1)
+          // Admin rejected a valid claim → kick
+          setClaimState('rejected_valid')
+          setIsKicked(true)
         }
       })
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   }, [id, player])
 
-  // Animate new number
+  // Animate newest number
   useEffect(() => {
     if (calledNumbers.length > prevCount) {
       const n = calledNumbers[calledNumbers.length - 1].number
@@ -77,7 +80,7 @@ export function GameRoom() {
     }
   }, [calledNumbers, prevCount])
 
-  // Navigate on lobby end
+  // Navigate to result when lobby completes
   useEffect(() => {
     if (lobby?.status === 'completed') {
       setTimeout(() => navigate(`/result/${id}`), 2000)
@@ -86,37 +89,50 @@ export function GameRoom() {
 
   const numbers = calledNumbers.map(c => c.number)
   const hasWin = myCard ? checkWin(myCard.card_data, numbers) : false
-  const isClaimLocked = falseClaimCount >= 1 && !hasWin
   const currentNum = numbers[numbers.length - 1] ?? null
 
   const handleCellTap = useCallback((num: number | null) => {
     if (num === null) return
     setManuallyMarked(prev => {
       const next = new Set(prev)
-      if (next.has(num)) next.delete(num)
-      else next.add(num)
+      next.has(num) ? next.delete(num) : next.add(num)
       return next
     })
   }, [])
 
-  async function claimBingo(force = false) {
-    if (!player || !id || !myCard || claiming || claimed) return
+  async function submitClaim(force = false) {
+    if (!player || !id || !myCard) return
+    if (claimState !== 'idle') return
+
     if (!hasWin && !force) {
       setShowFalseClaimModal(true)
       return
     }
-    if (isClaimLocked) return
-    setClaiming(true)
-    const { error } = await supabase.from('bingo_claims').insert({
-      lobby_id: id,
-      player_id: player.id,
-      lobby_card_id: myCard.id,
-      status: 'pending',
+
+    setClaimState('submitting')
+
+    const { data: { session } } = await supabase.auth.getSession()
+    const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/submit-claim`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session?.access_token}`,
+      },
+      body: JSON.stringify({ lobby_id: id, lobby_card_id: myCard.id }),
     })
-    setClaiming(false)
-    if (!error) {
-      setClaimed(true)
-      setClaimStatus('pending')
+
+    const json = await res.json()
+
+    if (!res.ok || json.error) {
+      setClaimState('idle')
+      return
+    }
+
+    if (json.valid === false) {
+      setClaimState('false_claim')
+      setIsKicked(true)
+    } else {
+      setClaimState('pending')
     }
   }
 
@@ -152,36 +168,30 @@ export function GameRoom() {
       <div className="px-3 mb-4">
         <div className="grid gap-0.5" style={{ gridTemplateColumns: 'repeat(15, 1fr)' }}>
           {Array.from({ length: 75 }, (_, i) => i + 1).map(n => (
-            <div
-              key={n}
-              className={[
-                'aspect-square flex items-center justify-center text-[9px] font-bold rounded',
-                n === currentNum
-                  ? 'bg-amber-500 text-white'
-                  : numbers.includes(n)
-                  ? 'bg-emerald-600 text-white'
-                  : 'bg-[#1a1035] text-purple-700',
-              ].join(' ')}
-            >
-              {n}
-            </div>
+            <div key={n} className={[
+              'aspect-square flex items-center justify-center text-[9px] font-bold rounded',
+              n === currentNum ? 'bg-amber-500 text-white' :
+              numbers.includes(n) ? 'bg-emerald-600 text-white' : 'bg-[#1a1035] text-purple-700',
+            ].join(' ')}>{n}</div>
           ))}
         </div>
       </div>
 
-      {/* Player's bingo card */}
+      {/* Player's card */}
       <div className="px-4 mb-4">
-        <div className="bg-[#1a1035] rounded-2xl p-4 border border-purple-900/40">
+        <div className={`bg-[#1a1035] rounded-2xl p-4 border ${isKicked ? 'border-red-900/40 opacity-60' : 'border-purple-900/40'}`}>
           {myCard ? (
             <>
               <BingoCardDisplay
                 card={myCard.card_data}
                 calledNumbers={numbers}
-                manuallyMarked={manuallyMarked}
-                onCellTap={handleCellTap}
+                manuallyMarked={!isKicked ? manuallyMarked : undefined}
+                onCellTap={!isKicked ? handleCellTap : undefined}
                 cardNumber={myCard.card_number}
               />
-              <p className="text-purple-600 text-[10px] text-center mt-1">Tap numbers to mark them manually</p>
+              {!isKicked && (
+                <p className="text-purple-600 text-[10px] text-center mt-1">Tap numbers to mark them manually</p>
+              )}
             </>
           ) : (
             <p className="text-purple-500 text-center text-sm py-4">No card assigned.</p>
@@ -189,46 +199,65 @@ export function GameRoom() {
         </div>
       </div>
 
-      {/* BINGO button area */}
-      {myCard && lobby?.status === 'active' && (
+      {/* Kicked state */}
+      {isKicked && (
+        <div className="mx-4 mb-4">
+          <div className={`rounded-2xl p-5 text-center border ${claimState === 'false_claim' ? 'bg-red-950/40 border-red-800/40' : 'bg-orange-950/40 border-orange-800/40'}`}>
+            <div className="text-3xl mb-2">{claimState === 'false_claim' ? '🚫' : '⚠️'}</div>
+            <div className={`font-black text-lg mb-1 ${claimState === 'false_claim' ? 'text-red-400' : 'text-orange-400'}`}>
+              {claimState === 'false_claim' ? 'False Claim — Removed' : 'Claim Rejected'}
+            </div>
+            <p className="text-purple-300 text-sm mb-4">
+              {claimState === 'false_claim'
+                ? 'No valid BINGO pattern was found. You have been removed from this lobby.'
+                : 'Admin rejected your claim. You have been removed from this lobby.'}
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => navigate('/')}
+                className="flex-1 py-2.5 rounded-xl border border-purple-700 text-purple-300 font-semibold text-sm"
+              >
+                Back to Lobbies
+              </button>
+              <button
+                onClick={() => {}}
+                className="flex-1 py-2.5 rounded-xl bg-purple-900/60 text-purple-300 font-semibold text-sm"
+              >
+                Watch Game
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BINGO claim area — only when not kicked and game is active */}
+      {!isKicked && myCard && lobby?.status === 'active' && (
         <div className="px-4 space-y-2">
-          {claimStatus === 'verified' && (
-            <div className="w-full py-4 rounded-2xl bg-amber-500/20 border border-amber-500/40 text-center text-amber-400 font-black text-xl">
+          {claimState === 'verified' && (
+            <div className="w-full py-4 rounded-2xl bg-amber-500/20 border border-amber-500/40 text-center text-amber-400 font-black text-xl animate-pulse">
               🏆 BINGO Verified! You Won!
             </div>
           )}
 
-          {claimStatus === 'rejected' && (
-            <div className="w-full py-3 rounded-2xl bg-red-500/20 border border-red-500/30 text-center text-red-400 font-semibold text-sm">
-              ✗ False claim rejected.
-              {falseClaimCount >= 1 && ' Claim locked until you have a valid BINGO.'}
+          {claimState === 'pending' && (
+            <div className="w-full py-4 rounded-2xl bg-purple-500/20 border border-purple-500/30 text-center">
+              <div className="text-purple-300 font-semibold">BINGO submitted</div>
+              <div className="text-purple-500 text-xs mt-1">Waiting for admin verification…</div>
             </div>
           )}
 
-          {claimStatus === 'pending' && (
-            <div className="w-full py-3 rounded-2xl bg-purple-500/20 border border-purple-500/30 text-center text-purple-300 text-sm font-semibold">
-              BINGO claimed — waiting for verification…
-            </div>
-          )}
-
-          {!claimed && !claimStatus && (
+          {claimState === 'idle' && (
             <>
-              {isClaimLocked ? (
-                <div className="w-full py-4 rounded-2xl bg-gray-800 border border-gray-700 text-center text-gray-500 font-semibold">
-                  Claim locked — complete a valid BINGO first
-                </div>
-              ) : hasWin ? (
+              {hasWin ? (
                 <button
-                  onClick={() => claimBingo(false)}
-                  disabled={claiming}
+                  onClick={() => submitClaim(false)}
                   className="w-full py-4 rounded-2xl bg-gradient-to-r from-amber-500 to-amber-400 text-white font-black text-2xl tracking-widest shadow-lg shadow-amber-900/50 animate-pulse active:scale-95 transition-transform"
                 >
-                  {claiming ? 'Claiming…' : 'BINGO!'}
+                  BINGO!
                 </button>
               ) : (
                 <button
-                  onClick={() => claimBingo(false)}
-                  disabled={claiming}
+                  onClick={() => submitClaim(false)}
                   className="w-full py-3 rounded-2xl bg-[#1a1035] border border-purple-800 text-purple-500 font-semibold text-base"
                 >
                   I have BINGO
@@ -239,28 +268,35 @@ export function GameRoom() {
               )}
             </>
           )}
+
+          {claimState === 'submitting' && (
+            <div className="w-full py-4 rounded-2xl bg-[#1a1035] border border-purple-800 text-center text-purple-400 font-semibold">
+              Verifying…
+            </div>
+          )}
         </div>
       )}
 
-      {lobby?.status === 'paused' && (
+      {lobby?.status === 'paused' && !isKicked && (
         <div className="mx-4 py-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 text-center text-blue-400 font-semibold">
           Game paused
         </div>
       )}
+
       {lobby?.status === 'completed' && (
         <div className="mx-4 py-4 rounded-2xl bg-purple-500/10 border border-purple-500/30 text-center text-purple-300 font-semibold">
           Game over — loading results…
         </div>
       )}
 
-      {/* False claim confirmation modal */}
+      {/* False claim warning modal */}
       {showFalseClaimModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-6">
           <div className="bg-[#1a1035] rounded-2xl p-6 w-full max-w-sm border border-red-900/40">
             <div className="text-3xl text-center mb-3">⚠️</div>
             <h2 className="text-white font-black text-lg text-center mb-2">Are you sure?</h2>
             <p className="text-purple-300 text-sm text-center mb-4">
-              You don't appear to have a complete BINGO yet. False claims will be rejected and may lock your card.
+              You don't appear to have a complete BINGO yet. The server will verify your claim. A false claim will remove you from this lobby.
             </p>
             <div className="flex gap-3">
               <button
@@ -270,7 +306,7 @@ export function GameRoom() {
                 Cancel
               </button>
               <button
-                onClick={() => { setShowFalseClaimModal(false); claimBingo(true) }}
+                onClick={() => { setShowFalseClaimModal(false); submitClaim(true) }}
                 className="flex-1 py-3 rounded-xl bg-red-600 text-white font-bold"
               >
                 Claim Anyway

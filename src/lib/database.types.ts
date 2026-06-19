@@ -33,6 +33,8 @@ export interface LobbyPlayer {
   auto_clicker_enabled: boolean
   auto_clicker_fee: number
   false_claim_count: number
+  status: 'joined' | 'kicked'
+  is_locked: boolean
 }
 
 export interface LobbyCard {

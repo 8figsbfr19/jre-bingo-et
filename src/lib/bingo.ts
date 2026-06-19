@@ -50,6 +50,19 @@ export function checkWin(card: (number | null)[][], called: number[]): boolean {
   return false
 }
 
+// Returns human-readable winning pattern names, e.g. ["Row 3", "Column B"]
+export function detectWinningPattern(card: (number | null)[][], called: number[]): string[] {
+  const calledSet = new Set(called)
+  const hit = (r: number, c: number) => card[r][c] === null || calledSet.has(card[r][c] as number)
+  const patterns: string[] = []
+  const cols = ['B', 'I', 'N', 'G', 'O']
+  for (let r = 0; r < 5; r++) if ([0,1,2,3,4].every(c => hit(r, c))) patterns.push(`Row ${r + 1}`)
+  for (let c = 0; c < 5; c++) if ([0,1,2,3,4].every(r => hit(r, c))) patterns.push(`Column ${cols[c]}`)
+  if ([0,1,2,3,4].every(i => hit(i, i))) patterns.push('Diagonal ↘')
+  if ([0,1,2,3,4].every(i => hit(i, 4 - i))) patterns.push('Diagonal ↙')
+  return patterns
+}
+
 export const BINGO_LETTERS = ['B', 'I', 'N', 'G', 'O']
 
 export function columnLetter(num: number): string {
