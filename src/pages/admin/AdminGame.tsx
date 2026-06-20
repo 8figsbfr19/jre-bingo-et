@@ -25,6 +25,8 @@ interface LobbyPlayerRow {
   id: string
   player_id: string
   player_name: string
+  card_number?: number
+  joined_at: string
   false_claim_count: number
   status: string
 }
@@ -50,24 +52,37 @@ export function AdminGame() {
   const numbers = calledNumbers.map(c => c.number)
   const lastNum = numbers[numbers.length - 1]
 
-  // ── Live player list (shown while waiting) ──────────────────────────────
+  // ── Live player list — fetched regardless of lobby status ────────────────
   useEffect(() => {
     if (!id) return
 
     async function fetchPlayers() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data } = await (supabase as any)
+      const { data: lpData } = await (supabase as any)
         .from('lobby_players')
-        .select('id, player_id, false_claim_count, status, players(first_name, telegram_username)')
+        .select('id, player_id, false_claim_count, status, joined_at, players(first_name, telegram_username)')
         .eq('lobby_id', id!)
         .order('joined_at', { ascending: true })
 
+      // Also fetch card numbers for each player
+      const { data: cardData } = await supabase
+        .from('lobby_cards')
+        .select('player_id, card_number')
+        .eq('lobby_id', id!)
+        .not('player_id', 'is', null)
+
+      const cardMap: Record<string, number> = Object.fromEntries(
+        (cardData ?? []).map(c => [c.player_id, c.card_number]),
+      )
+
       setLobbyPlayers(
-        (data ?? []).map((lp: Record<string, unknown>) => ({
+        (lpData ?? []).map((lp: Record<string, unknown>) => ({
           id: lp.id as string,
           player_id: lp.player_id as string,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           player_name: displayName(lp.players as any),
+          card_number: cardMap[lp.player_id as string],
+          joined_at: lp.joined_at as string,
           false_claim_count: (lp.false_claim_count as number) ?? 0,
           status: (lp.status as string) ?? 'joined',
         })),
@@ -79,6 +94,8 @@ export function AdminGame() {
     const ch = supabase
       .channel(`admin_lp_${id}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lobby_players', filter: `lobby_id=eq.${id}` },
+        () => fetchPlayers())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lobby_cards', filter: `lobby_id=eq.${id}` },
         () => fetchPlayers())
       .subscribe()
 
@@ -132,11 +149,10 @@ export function AdminGame() {
       .subscribe()
 
     return () => { supabase.removeChannel(ch) }
-  // numbers changes affect winning_patterns display
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, numbers.length])
 
-  // ── Auto-call ───────────────────────────────────────────────────────────
+  // ── Auto-call interval ────────────────────────────────────────────────────
   useEffect(() => {
     if (!autoCall || lobby?.status !== 'active') return
     const interval = setInterval(async () => {
@@ -152,18 +168,22 @@ export function AdminGame() {
     return <div className="flex h-screen items-center justify-center text-gray-400">Access denied.</div>
   }
 
+  const activePlayers = lobbyPlayers.filter(p => p.status !== 'kicked')
+  const prizePool = (lobby?.prize_pool && lobby.prize_pool > 0)
+    ? lobby.prize_pool
+    : activePlayers.length * (lobby?.stake_amount ?? 0)
+
   async function setStatus(status: LobbyStatus) {
     if (!id) return
     const update: Record<string, unknown> = { status }
 
     if (status === 'active') {
       update.started_at = new Date().toISOString()
-      const { count } = await supabase
-        .from('lobby_cards').select('*', { count: 'exact', head: true })
-        .eq('lobby_id', id).not('player_id', 'is', null)
-      update.prize_pool = (count ?? 0) * (lobby?.stake_amount ?? 0)
+      // Prize pool = non-kicked players × stake
+      const confirmedCount = activePlayers.length
+      update.prize_pool = confirmedCount * (lobby?.stake_amount ?? 0)
 
-      // Legacy bingo_cards for players who joined via old flow
+      // Legacy bingo_cards fallback
       const { generateCard } = await import('../../lib/bingo')
       const { data: lps } = await supabase.from('lobby_players').select('player_id').eq('lobby_id', id!)
       if (lps) {
@@ -203,56 +223,68 @@ export function AdminGame() {
     setVerifying(null)
   }
 
-  const prizePool = (lobby?.prize_pool ?? 0) ||
-    lobbyPlayers.filter(p => p.status !== 'kicked').length * (lobby?.stake_amount ?? 0)
-  const activePlayers = lobbyPlayers.filter(p => p.status !== 'kicked')
-
   return (
     <div className="min-h-screen bg-gray-50 px-4 pt-6 pb-10">
       <Link to="/admin/lobbies" className="text-sm text-gray-400 mb-4 block">← Lobbies</Link>
 
       {/* Lobby header */}
       <h1 className="text-xl font-bold text-gray-900 mb-1">{lobby?.title ?? '…'}</h1>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500 mb-1">
-        <span><b>{activePlayers.length}</b> active players</span>
+      <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-sm text-gray-500 mb-2">
+        <span>Status: <b className="capitalize">{lobby?.status}</b></span>
         <span>Stake: <b>{lobby?.stake_amount} ETB</b></span>
-        <span>Status: <b>{lobby?.status}</b></span>
         <span className="text-amber-600 font-semibold">Pool: {prizePool} ETB</span>
+        <span>{numbers.length} / 75 called</span>
       </div>
-      {lobby?.started_at && <div className="text-xs text-gray-400 mb-1">Started: {formatDate(lobby.started_at)}</div>}
-      {lobby?.ended_at && <div className="text-xs text-gray-400 mb-1">Ended: {formatDate(lobby.ended_at)}</div>}
+      {lobby?.started_at && <div className="text-xs text-gray-400 mb-0.5">Started: {formatDate(lobby.started_at)}</div>}
+      {lobby?.ended_at && <div className="text-xs text-gray-400 mb-2">Ended: {formatDate(lobby.ended_at)}</div>}
 
-      {/* ── WAITING: live player list ────────────────────────────────────── */}
-      {lobby?.status === 'waiting' && (
-        <div className="mt-4 mb-4 bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
-            <span className="font-semibold text-gray-700 text-sm">Joined Players ({activePlayers.length})</span>
-            <span className="text-xs text-gray-400">Live</span>
-          </div>
-          {activePlayers.length === 0 ? (
-            <div className="px-4 py-6 text-center text-gray-400 text-sm">No players yet…</div>
-          ) : (
-            <div className="divide-y divide-gray-50">
-              {activePlayers.map((lp, i) => (
-                <div key={lp.id} className="flex items-center px-4 py-2">
-                  <span className="text-gray-400 text-xs w-5">{i + 1}</span>
-                  <span className="font-medium text-gray-800 text-sm ml-2">{lp.player_name}</span>
-                  {lp.false_claim_count > 0 && (
-                    <span className="ml-2 text-xs text-red-500">⚠ {lp.false_claim_count} false</span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+      {/* ── Player list (always shown) ────────────────────────────────────── */}
+      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden mb-4">
+        <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+          <span className="font-semibold text-gray-700 text-sm">
+            Players ({activePlayers.length} confirmed{lobbyPlayers.some(p => p.status === 'kicked') ? `, ${lobbyPlayers.filter(p => p.status === 'kicked').length} kicked` : ''})
+          </span>
+          <span className="text-xs text-gray-400">Live</span>
         </div>
-      )}
+        {lobbyPlayers.length === 0 ? (
+          <div className="px-4 py-5 text-center text-gray-400 text-sm">No players yet…</div>
+        ) : (
+          <div className="divide-y divide-gray-50">
+            {lobbyPlayers.map((lp, i) => (
+              <div key={lp.id} className={`flex items-center px-4 py-2 ${lp.status === 'kicked' ? 'opacity-40' : ''}`}>
+                <span className="text-gray-400 text-xs w-5 shrink-0">{i + 1}</span>
+                <div className="flex-1 min-w-0 ml-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium text-gray-800 text-sm">{lp.player_name}</span>
+                    {lp.card_number && (
+                      <span className="text-xs text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded font-medium">
+                        Card #{lp.card_number}
+                      </span>
+                    )}
+                    {lp.status === 'kicked' && (
+                      <span className="text-xs text-red-500 font-medium">kicked</span>
+                    )}
+                    {lp.false_claim_count > 0 && (
+                      <span className="text-xs text-red-400">⚠ {lp.false_claim_count} false</span>
+                    )}
+                  </div>
+                  <div className="text-gray-400 text-xs">{formatDate(lp.joined_at)}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
-      {/* ── Status controls ──────────────────────────────────────────────── */}
-      <div className="flex flex-wrap gap-2 my-4">
+      {/* ── Status controls ───────────────────────────────────────────────── */}
+      <div className="flex flex-wrap gap-2 mb-4">
         {lobby?.status === 'waiting' && (
-          <button onClick={() => setStatus('active')}
-            className="px-4 py-2 bg-green-500 text-white rounded-lg text-sm font-medium">
-            Start Game
+          <button
+            onClick={() => setStatus('active')}
+            disabled={activePlayers.length === 0}
+            className="px-4 py-2 bg-green-500 text-white rounded-lg text-sm font-medium disabled:opacity-40"
+          >
+            Start Game{activePlayers.length > 0 ? ` (${activePlayers.length} players)` : ''}
           </button>
         )}
         {lobby?.status === 'active' && (
@@ -269,7 +301,7 @@ export function AdminGame() {
         )}
       </div>
 
-      {/* ── Call number ──────────────────────────────────────────────────── */}
+      {/* ── Call number ───────────────────────────────────────────────────── */}
       {lobby?.status === 'active' && (
         <>
           {lastNum && (
@@ -293,7 +325,7 @@ export function AdminGame() {
         </>
       )}
 
-      {/* ── 75-number grid ───────────────────────────────────────────────── */}
+      {/* ── 75-number grid ────────────────────────────────────────────────── */}
       {(lobby?.status === 'active' || lobby?.status === 'paused' || lobby?.status === 'completed') && (
         <div className="grid gap-1 mb-6" style={{ gridTemplateColumns: 'repeat(15, 1fr)' }}>
           {Array.from({ length: 75 }, (_, i) => i + 1).map(n => (
@@ -306,7 +338,7 @@ export function AdminGame() {
         </div>
       )}
 
-      {/* ── Claims panel ─────────────────────────────────────────────────── */}
+      {/* ── Claims panel ──────────────────────────────────────────────────── */}
       {enrichedClaims.length > 0 && (
         <div>
           <h2 className="font-semibold text-gray-700 mb-3">
@@ -315,8 +347,7 @@ export function AdminGame() {
           <div className="space-y-3">
             {enrichedClaims.map(claim => (
               <div key={claim.id} className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-                {/* Claim header */}
-                <div className="flex items-center justify-between px-4 py-3">
+                <div className="flex items-start justify-between px-4 py-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-semibold text-gray-800 text-sm">{claim.player_name}</span>
@@ -339,9 +370,11 @@ export function AdminGame() {
                         Pattern: {claim.winning_patterns.join(', ')}
                       </div>
                     )}
+                    <div className="text-xs text-gray-400 mt-0.5">
+                      Stake: <b>{lobby?.stake_amount} ETB</b> · Pool: <b>{prizePool} ETB</b>
+                    </div>
                   </div>
 
-                  {/* Action buttons */}
                   <div className="flex flex-col gap-1.5 ml-3 shrink-0">
                     {claim.status === 'pending' && (
                       <>
@@ -372,15 +405,8 @@ export function AdminGame() {
                   </div>
                 </div>
 
-                {/* Expandable card preview */}
                 {expandedClaim === claim.id && claim.card_data && (
                   <div className="px-4 pb-4 border-t border-gray-50 pt-3">
-                    <div className="mb-2 text-xs text-gray-500">
-                      Stake: <b>{lobby?.stake_amount} ETB</b> · Pool: <b>{prizePool} ETB</b>
-                      {claim.winning_patterns.length > 0 && (
-                        <> · Patterns: <span className="text-emerald-600 font-semibold">{claim.winning_patterns.join(', ')}</span></>
-                      )}
-                    </div>
                     <BingoCardDisplay
                       card={claim.card_data}
                       calledNumbers={numbers}

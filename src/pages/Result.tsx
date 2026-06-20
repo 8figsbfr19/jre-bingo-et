@@ -23,7 +23,6 @@ export function Result() {
 
   useEffect(() => {
     if (!id) return
-    // Poll a few times since game_history may be written slightly after lobby completes
     let tries = 0
     const attempt = async () => {
       const { data } = await supabase.from('game_history').select('*').eq('lobby_id', id).single()
@@ -38,7 +37,7 @@ export function Result() {
           supabase.from('lobby_cards').select('*').eq('id', data.winner_card_id).single()
             .then(({ data: c }) => setWinnerCard(c ?? null))
         }
-      } else if (tries < 5) {
+      } else if (tries < 6) {
         tries++
         setTimeout(attempt, 1500)
       } else {
@@ -51,6 +50,7 @@ export function Result() {
   const myCard = cards.find(c => c.player_id === player?.id)
   const numbers = calledNumbers.map(c => c.number)
   const isWinner = history?.winner_id === player?.id
+  const winnerName = displayName(winner)
 
   if (loading) {
     return (
@@ -75,52 +75,76 @@ export function Result() {
               Total Pool: <span className="text-amber-400">{history.prize_pool} ETB</span>
             </div>
             <div className="text-purple-400 text-xs mt-1">
-              {history.balls_called} balls · {history.total_players} players · {formatDate(history.ended_at)}
+              {history.balls_called} balls · {history.total_players} players
+            </div>
+            <div className="text-purple-500 text-xs mt-0.5">
+              Completed: {formatDate(history.ended_at)}
             </div>
           </>
         )}
       </div>
 
       <div className="px-4 space-y-4">
-        {/* Winner info row */}
-        {!isWinner && winner && (
+
+        {/* ── Winner info (shown to losers) ──────────────────────────── */}
+        {!isWinner && (
           <div className="bg-[#1a1035] rounded-2xl p-4 border border-red-900/30">
             <div className="text-purple-400 text-xs font-semibold uppercase tracking-widest mb-2">Winner</div>
             <div className="flex items-center gap-3 mb-3">
-              <div className="w-9 h-9 rounded-full bg-amber-500 flex items-center justify-center font-black text-white">
-                {(winner.first_name?.[0] ?? winner.telegram_username?.[0] ?? 'W').toUpperCase()}
+              <div className="w-9 h-9 rounded-full bg-amber-500 flex items-center justify-center font-black text-white shrink-0">
+                {(winner?.first_name?.[0] ?? winner?.telegram_username?.[0] ?? 'W').toUpperCase()}
               </div>
-              <div>
-                <div className="text-white font-bold">{displayName(winner)}</div>
-                {winner.telegram_username && (
+              <div className="flex-1 min-w-0">
+                <div className="text-white font-bold truncate">{winner ? winnerName : '—'}</div>
+                {winner?.telegram_username && (
                   <div className="text-purple-500 text-xs">@{winner.telegram_username}</div>
                 )}
               </div>
               {winnerCard && (
-                <div className="ml-auto text-amber-400 font-bold text-sm">
+                <div className="text-amber-400 font-bold text-sm shrink-0">
                   Card #{winnerCard.card_number}
                 </div>
               )}
             </div>
             {winnerCard && (
-              <BingoCardDisplay card={winnerCard.card_data} calledNumbers={numbers} cardNumber={winnerCard.card_number} compact />
+              <BingoCardDisplay
+                card={winnerCard.card_data}
+                calledNumbers={numbers}
+                cardNumber={winnerCard.card_number}
+                compact
+              />
             )}
           </div>
         )}
 
-        {/* Winner's own card */}
+        {/* ── Winner's own card ──────────────────────────────────────── */}
         {isWinner && winnerCard && (
           <div className="bg-[#1a1035] rounded-2xl p-4 border border-amber-500/40">
-            <div className="text-amber-400 text-xs font-semibold uppercase tracking-widest mb-2">Your Winning Card</div>
-            <BingoCardDisplay card={winnerCard.card_data} calledNumbers={numbers} cardNumber={winnerCard.card_number} />
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-amber-400 text-xs font-semibold uppercase tracking-widest">Your Winning Card</div>
+              <div className="text-amber-400 font-bold text-sm">Card #{winnerCard.card_number}</div>
+            </div>
+            <BingoCardDisplay
+              card={winnerCard.card_data}
+              calledNumbers={numbers}
+              cardNumber={winnerCard.card_number}
+            />
           </div>
         )}
 
-        {/* Loser's own card */}
+        {/* ── Loser's own card ───────────────────────────────────────── */}
         {!isWinner && myCard && (
           <div className="bg-[#1a1035] rounded-2xl p-4 border border-purple-900/40">
-            <div className="text-purple-400 text-xs font-semibold uppercase tracking-widest mb-2">Your Card</div>
-            <BingoCardDisplay card={myCard.card_data} calledNumbers={numbers} cardNumber={myCard.card_number} compact />
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-purple-400 text-xs font-semibold uppercase tracking-widest">Your Card</div>
+              <div className="text-purple-400 font-bold text-sm">Card #{myCard.card_number}</div>
+            </div>
+            <BingoCardDisplay
+              card={myCard.card_data}
+              calledNumbers={numbers}
+              cardNumber={myCard.card_number}
+              compact
+            />
           </div>
         )}
 
