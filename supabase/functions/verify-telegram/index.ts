@@ -170,6 +170,29 @@ serve(async (req) => {
     player = inserted
   }
 
+  // Merge phone registration if the user shared contact via bot before opening Mini App
+  if (!player?.phone_number) {
+    const { data: phoneReg } = await serviceClient
+      .from('phone_registrations')
+      .select('phone_number, phone_verified, registered_at')
+      .eq('telegram_id', tgUser.id)
+      .single()
+
+    if (phoneReg?.phone_number) {
+      const { data: withPhone } = await serviceClient
+        .from('players')
+        .update({
+          phone_number:      phoneReg.phone_number,
+          phone_verified:    phoneReg.phone_verified,
+          contact_shared_at: phoneReg.registered_at,
+        })
+        .eq('id', userId)
+        .select('*')
+        .single()
+      if (withPhone) player = withPhone
+    }
+  }
+
   return new Response(
     JSON.stringify({
       access_token: session.access_token,
